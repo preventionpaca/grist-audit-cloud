@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: grist-audit
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: GRIST_HOST
+        value: https://docs.getgrist.com
+      # Add in Render dashboard:
+      # - key: GRIST_API_KEY
+      # - key: GRIST_DOC_ID
