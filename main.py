@@ -5,19 +5,26 @@ from datetime import datetime
 import requests
 from flask import Flask, jsonify, send_from_directory
 
+# ---- Config ----
 HOST = os.getenv("GRIST_HOST", "https://docs.getgrist.com")
 DOC = os.getenv("GRIST_DOC_ID") or ""
 API_KEY = os.getenv("GRIST_API_KEY") or ""
+TARGET_TABLE = os.getenv("GRIST_TABLE", "Liste_des_equipements")
 DATA_DIR = os.getenv("DATA_DIR", os.getcwd())
-CUR_JSON = os.path.join(DATA_DIR, "schema_current.json")
-DIFF_JSON = os.path.join(DATA_DIR, "schema_diff.json")
+
+CUR_SCHEMA = os.path.join(DATA_DIR, "schema_current.json")
+DIFF_SCHEMA = os.path.join(DATA_DIR, "schema_diff.json")
+CUR_EQUIP = os.path.join(DATA_DIR, "equip_current.json")
+DIFF_EQUIP = os.path.join(DATA_DIR, "equip_diff.json")
 LOCK_FILE = os.path.join(DATA_DIR, ".lock")
 
+# ---- Fonctions utilitaires ----
 def _req(method, url, **kw):
     for i in range(4):
         try:
-            r = requests.request(method, url, timeout=30, **kw)
-            if r.status_code in (502,503,504): time.sleep(1.5*(i+1)); continue
+            r = requests.request(method, url, timeout=40, **kw)
+            if r.status_code in (502,503,504):
+                time.sleep(1.5*(i+1)); continue
             r.raise_for_status()
             return r
         except requests.RequestException:
@@ -31,11 +38,14 @@ def api_get(path, params=None):
 
 def list_tables(): return api_get(f"/docs/{DOC}/tables").get("tables", [])
 def list_columns(t): return api_get(f"/docs/{DOC}/tables/{t}/columns", params={"hidden":"true"}).get("columns", [])
+def fetch_rows(table): return api_get(f"/docs/{DOC}/tables/{table}/data").get("records", [])
 
 def ref_target(t): 
     if not isinstance(t,str): return ""
     m=re.match(r"^Ref(?:List)?:([\w.$-]+)$",t); return m.group(1) if m else ""
 
+# ---- Scan du schéma ----
+FIELDS=["type","isFormula","refTableId","visibleCol","label","description"]
 def scan_schema():
     rows=[]
     for t in list_tables():
@@ -51,28 +61,40 @@ def scan_schema():
             }); pos+=1
     return rows
 
-FIELDS=["type","isFormula","refTableId","visibleCol","label","description"]
-def _index(rows): return { (r.get("tableId",""),r.get("colId","")):r for r in rows }
+def _index(rows):  return { (r.get("tableId",""), r.get("colId","")): r for r in rows }
 def _tables(rows): return set(r.get("tableId","") for r in rows)
 
-def make_diff(cur, base):
+def make_schema_diff(cur, base):
     out=[]; ic,ib=_index(cur),_index(base); tc,tb=_tables(cur),_tables(base)
-    for t in sorted(tc-tb): out.append({"changeType":"ADDED_TABLE","tableId":t})
-    for t in sorted(tb-tc): out.append({"changeType":"REMOVED_TABLE","tableId":t})
-    for k in sorted(set(ic.keys())|set(ib.keys())):
-        c,b=ic.get(k),ib.get(k); t,col=k
+    for t in sorted(tc - tb): out.append({"changeType":"ADDED_TABLE","tableId":t})
+    for t in sorted(tb - tc): out.append({"changeType":"REMOVED_TABLE","tableId":t})
+    for k in sorted(set(ic.keys()) | set(ib.keys())):
+        c,b = ic.get(k), ib.get(k); t,col = k
         if c and not b: out.append({"changeType":"ADDED_COL","tableId":t,"colId":col}); continue
         if b and not c: out.append({"changeType":"REMOVED_COL","tableId":t,"colId":col}); continue
         for f in FIELDS:
-            ov,nv=b.get(f),c.get(f)
-            if ov!=nv: out.append({"changeType":"CHANGED_FIELD","tableId":t,"colId":col,"field":f,"oldValue":str(ov),"newValue":str(nv)})
+            ov,nv = b.get(f), c.get(f)
+            if ov != nv:
+                out.append({"changeType":"CHANGED_FIELD","tableId":t,"colId":col,"field":f,"oldValue":str(ov),"newValue":str(nv)})
+    return out
+
+# ---- Scan du contenu ----
+def make_equip_diff(cur, base):
+    cur_idx = {r["id"]:r["fields"] for r in cur}
+    base_idx = {r["id"]:r["fields"] for r in base}
+    out=[]
+    for id_ in set(cur_idx.keys()) | set(base_idx.keys()):
+        c,b = cur_idx.get(id_), base_idx.get(id_)
+        if c and not b: out.append({"changeType":"ADDED_ROW","id":id_})
+        elif b and not c: out.append({"changeType":"REMOVED_ROW","id":id_})
+        elif c!=b: out.append({"changeType":"CHANGED_ROW","id":id_})
     return out
 
 def save_json(o,p): open(p,"w",encoding="utf-8").write(json.dumps(o,ensure_ascii=False,indent=2))
 
-app=Flask(__name__)
+# ---- Flask ----
+app = Flask(__name__)
 
-# ---- CORS ----
 @app.after_request
 def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -82,60 +104,53 @@ def add_cors_headers(resp):
 
 @app.route("/", defaults={"_path": ""}, methods=["OPTIONS"])
 @app.route("/<path:_path>", methods=["OPTIONS"])
-def cors_preflight(_path):
-    return ("", 204)
+def cors_preflight(_path): return ("", 204)
 
 @app.get("/")
-def index():
-    return jsonify({"service":"grist-audit-cloud","ok":True,"hint":"use /status, /run, /result"})
+def index(): 
+    return jsonify({"service":"grist-audit-cloud","ok":True,"hint":"use /run, /result"})
 
 @app.get("/status")
 def status():
-    busy = os.path.exists(LOCK_FILE)
     return jsonify({
         "ok": bool(API_KEY and DOC),
         "doc": DOC,
-        "busy": busy,
-        "has_current": os.path.exists(CUR_JSON),
-        "has_diff": os.path.exists(DIFF_JSON),
+        "host": HOST,
         "time": datetime.utcnow().isoformat()+"Z"
     })
 
-# ---- Thread background pour ne pas bloquer Render ----
 def background_audit():
-    open(LOCK_FILE,"w").write("running")
+    open(LOCK_FILE,"w").write("run")
     try:
-        base = json.load(open(CUR_JSON,encoding="utf-8")) if os.path.exists(CUR_JSON) else []
-        cur = scan_schema()
-        save_json(cur,CUR_JSON)
-        diff = make_diff(cur,base)
-        save_json(diff,DIFF_JSON)
+        base_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else []
+        base_equip  = json.load(open(CUR_EQUIP)) if os.path.exists(CUR_EQUIP) else []
+        cur_schema = scan_schema()
+        cur_equip  = fetch_rows(TARGET_TABLE)
+        save_json(cur_schema, CUR_SCHEMA)
+        save_json(cur_equip, CUR_EQUIP)
+        save_json(make_schema_diff(cur_schema, base_schema), DIFF_SCHEMA)
+        save_json(make_equip_diff(cur_equip, base_equip), DIFF_EQUIP)
     finally:
         if os.path.exists(LOCK_FILE): os.remove(LOCK_FILE)
 
 @app.post("/run")
 def run():
-    if not API_KEY or not DOC:
-        return jsonify({"ok":False,"error":"Missing GRIST_API_KEY or GRIST_DOC_ID"}),400
-    if os.path.exists(LOCK_FILE):
-        return jsonify({"ok":False,"busy":True,"error":"Audit already running"})
+    if os.path.exists(LOCK_FILE): return jsonify({"ok":False,"busy":True})
     threading.Thread(target=background_audit,daemon=True).start()
     return jsonify({"ok":True,"started":True,"time":datetime.utcnow().isoformat()+"Z"})
 
 @app.get("/result")
 def result():
-    cur = json.load(open(CUR_JSON,encoding="utf-8")) if os.path.exists(CUR_JSON) else []
-    diff = json.load(open(DIFF_JSON,encoding="utf-8")) if os.path.exists(DIFF_JSON) else []
+    diff_schema = json.load(open(DIFF_SCHEMA)) if os.path.exists(DIFF_SCHEMA) else []
+    diff_equip = json.load(open(DIFF_EQUIP)) if os.path.exists(DIFF_EQUIP) else []
     return jsonify({
-        "summary": f"{len(diff)} changement(s).",
-        "current_count": len(cur),
-        "diff_count": len(diff),
-        "diff": diff[:300]
+        "summary": f"{len(diff_schema)} chgt schéma, {len(diff_equip)} chgt contenu",
+        "schema_diff": diff_schema,
+        "equip_diff": diff_equip
     })
 
 @app.get("/files/<path:fname>")
-def files(fname):
-    return send_from_directory(DATA_DIR,fname,mimetype="application/json")
+def files(fname): return send_from_directory(DATA_DIR,fname,mimetype="application/json")
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","8000"))
