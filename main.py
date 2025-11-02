@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Audit Grist cloud (structure + diff + contenu Liste_des_equipements)
-- Diff fiable (added/changed/removed) basé sur baseline CUR_EQUIP
-- Persistance des suppressions et créations (historique entre audits)
-- Expose /result avec "kind" par ligne: added/changed/normal (removed listé à part)
+Grist Audit Cloud – structure + diff + historique persistant
+- Diff fiable (added/changed/removed) basé sur baseline précédente
+- Historisation persistante des événements (equip_history.json) avec before/after + horodatage
+- Fichiers de confort: equip_added.json, equip_removed.json
+- /result renvoie l'état courant des lignes avec rec.kind (added/changed/normal)
 """
 
 import os, json, time, re, threading, unicodedata
 from datetime import datetime
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 
 HOST = os.getenv("GRIST_HOST", "https://docs.getgrist.com")
 DOC  = os.getenv("GRIST_DOC_ID") or ""
@@ -26,7 +27,9 @@ DIFF_SCHEMA = os.path.join(DATA_DIR, "schema_diff.json")
 CUR_EQUIP   = os.path.join(DATA_DIR, "equip_current.json")
 DIFF_EQUIP  = os.path.join(DATA_DIR, "equip_diff.json")
 
-# Nouveaux historiques
+# Historique persistant (événements avec before/after)
+EQUIP_HISTORY = os.path.join(DATA_DIR, "equip_history.json")  # [{id, action, at, before, after}]
+# Aides de lecture (optionnels)
 EQUIP_REMOVED = os.path.join(DATA_DIR, "equip_removed.json")  # [{id, fields, deletedAt}]
 EQUIP_ADDED   = os.path.join(DATA_DIR, "equip_added.json")    # [{id, fields, createdAt}]
 
@@ -113,7 +116,6 @@ def scan_schema():
             }); pos+=1
     return rows
 
-def _index(rows):  return {r["id"]: r for r in rows} if rows else {}
 def _index_schema(rows): return {(r.get("tableId",""), r.get("colId","")): r for r in rows}
 def _tables(rows): return set(r.get("tableId","") for r in rows)
 
@@ -134,7 +136,7 @@ def make_schema_diff(cur, base):
 
 # ------------- Diff contenu fiable ------------
 def make_equip_diff(cur, base):
-    """Compare par id: ADDED_ROW si id∈cur\base; REMOVED_ROW si id∈base\cur; CHANGED_ROW si fields diffèrent."""
+    """Compare par id: ADDED_ROW / CHANGED_ROW / REMOVED_ROW."""
     cur_idx  = {r["id"]: r.get("fields", {}) for r in (cur or [])}
     base_idx = {r["id"]: r.get("fields", {}) for r in (base or [])}
     out=[]
@@ -149,21 +151,21 @@ def make_equip_diff(cur, base):
             out.append({"changeType":"CHANGED_ROW","id":rid})
     return out
 
-# ---------- Status + persistance histos -------
 def mark_status_equip(cur, diff):
-    """Ajoute r['status'] ET r['kind'] aux lignes courantes en mappant le diff par id."""
+    """Ajoute rec.kind (added/changed/removed/normal) sur l'état courant."""
     kind_map={}
     for d in (diff or []):
         ct=d.get("changeType"); rid=d.get("id")
-        if ct=="ADDED_ROW":   kind_map[rid]="added"
+        if ct=="ADDED_ROW":     kind_map[rid]="added"
         elif ct=="CHANGED_ROW": kind_map[rid]="changed"
         elif ct=="REMOVED_ROW": kind_map[rid]="removed"
     for r in (cur or []):
         k = kind_map.get(r["id"], "normal")
+        r["kind"] = k
         r["status"] = "added" if k=="added" else ("changed" if k=="changed" else "normal")
-        r["kind"]   = k
     return cur
 
+# ----------------- Utils JSON -----------------
 def save_json(o,p):
     with open(p,"w",encoding="utf-8") as f:
         json.dump(o,f,ensure_ascii=False,indent=2)
@@ -193,7 +195,7 @@ def cors_preflight(_path): return ("", 204)
 
 @app.get("/")
 def index():
-    return jsonify({"service":"grist-audit-cloud","ok":True,"hint":"use /run then /result"})
+    return jsonify({"service":"grist-audit-cloud","ok":True,"hint":"POST /run then GET /result, history at /files/equip_history.json"})
 
 @app.get("/status")
 def status():
@@ -208,19 +210,9 @@ def status():
         "time": datetime.utcnow().isoformat()+"Z"
     })
 
-@app.get("/debug/equip")
-def debug_equip():
-    tid = resolve_target_table_id()
-    try:
-        recs_records = api_get(f"/docs/{DOC}/tables/{tid}/records", params={"limit": 3}).get("records", [])
-        recs_data    = api_get(f"/docs/{DOC}/tables/{tid}/data",    params={"limit": 3}).get("records", [])
-        return jsonify({
-            "resolved_table_id": tid,
-            "records_endpoint_count": len(recs_records),
-            "data_endpoint_count": len(recs_data)
-        })
-    except Exception as e:
-        return jsonify({"resolved_table_id": tid, "error": str(e)}), 500
+@app.get("/files/<path:fname>")
+def files(fname):
+    return send_from_directory(DATA_DIR, fname)
 
 # --------------- Background audit ------------
 def background_audit():
@@ -245,37 +237,46 @@ def background_audit():
         diff_schema = make_schema_diff(cur_schema, base_schema)
         diff_equip  = make_equip_diff(cur_equip, base_equip)
 
-        # ---- Historiser suppressions et créations (depuis le diff fiable) ----
+        # ---- Historiser événements (added/changed/removed) ----
         try:
             now_iso = datetime.utcnow().isoformat()+"Z"
-            base_idx  = {r["id"]: r.get("fields", {}) for r in (base_equip or [])}
-            cur_idx   = {r["id"]: r.get("fields", {}) for r in (cur_equip or [])}
+            base_idx = {r["id"]: r.get("fields", {}) for r in (base_equip or [])}
+            cur_idx  = {r["id"]: r.get("fields", {}) for r in (cur_equip  or [])}
 
-            removed_snaps = []
-            added_snaps   = []
+            history = load_json_list(EQUIP_HISTORY)
+            hist_keys = {(h.get("id"), h.get("action"), json.dumps(h.get("before", {}), sort_keys=True), json.dumps(h.get("after", {}), sort_keys=True)) for h in history}
+
+            added_snaps, removed_snaps = [], []
             for d in diff_equip:
-                if d["changeType"]=="REMOVED_ROW":
-                    rid = d["id"]
-                    removed_snaps.append({"id": rid, "fields": base_idx.get(rid, {}), "deletedAt": now_iso})
-                elif d["changeType"]=="ADDED_ROW":
-                    rid = d["id"]
-                    added_snaps.append({"id": rid, "fields": cur_idx.get(rid, {}), "createdAt": now_iso})
+                rid = d["id"]; ct = d["changeType"]
+                before = base_idx.get(rid, {})
+                after  = cur_idx.get(rid, {})
+                event  = {"id": rid, "action": ct.replace("_ROW","").lower(), "at": now_iso, "before": before, "after": after}
+                key    = (event["id"], event["action"], json.dumps(event["before"], sort_keys=True), json.dumps(event["after"], sort_keys=True))
+                if key not in hist_keys:
+                    history.append(event); hist_keys.add(key)
+                if ct=="REMOVED_ROW":
+                    removed_snaps.append({"id": rid, "fields": before, "deletedAt": now_iso})
+                elif ct=="ADDED_ROW":
+                    added_snaps.append({"id": rid, "fields": after, "createdAt": now_iso})
 
             if removed_snaps:
-                hist = load_json_list(EQUIP_REMOVED)
-                existing = {(h.get("id"), json.dumps(h.get("fields", {}), sort_keys=True)) for h in hist}
+                rem = load_json_list(EQUIP_REMOVED)
+                ex  = {(h.get("id"), json.dumps(h.get("fields", {}), sort_keys=True)) for h in rem}
                 for snap in removed_snaps:
-                    key=(snap["id"], json.dumps(snap.get("fields", {}), sort_keys=True))
-                    if key not in existing: hist.append(snap)
-                save_json(hist, EQUIP_REMOVED)
+                    key = (snap["id"], json.dumps(snap.get("fields", {}), sort_keys=True))
+                    if key not in ex: rem.append(snap)
+                save_json(rem, EQUIP_REMOVED)
 
             if added_snaps:
-                hist = load_json_list(EQUIP_ADDED)
-                existing = {(h.get("id"), json.dumps(h.get("fields", {}), sort_keys=True)) for h in hist}
+                add = load_json_list(EQUIP_ADDED)
+                ex  = {(h.get("id"), json.dumps(h.get("fields", {}), sort_keys=True)) for h in add}
                 for snap in added_snaps:
-                    key=(snap["id"], json.dumps(snap.get("fields", {}), sort_keys=True))
-                    if key not in existing: hist.append(snap)
-                save_json(hist, EQUIP_ADDED)
+                    key = (snap["id"], json.dumps(snap.get("fields", {}), sort_keys=True))
+                    if key not in ex: add.append(snap)
+                save_json(add, EQUIP_ADDED)
+
+            save_json(history, EQUIP_HISTORY)
         except Exception:
             pass  # ne casse pas l'audit
 
@@ -286,7 +287,7 @@ def background_audit():
         save_json(diff_equip,  DIFF_EQUIP)
 
         PROGRESS.update({"percent": 100, "step": "Terminé"})
-        time.sleep(0.4)
+        time.sleep(0.3)
     finally:
         PROGRESS.update({"busy": False})
         try:
@@ -304,18 +305,22 @@ def run():
 
 @app.get("/result")
 def result():
-    # Charge dernier état (sans forcer un nouvel audit)
+    # Dernier état disponible (sans forcer un nouvel audit)
     cur_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else scan_schema()
     cur_equip  = json.load(open(CUR_EQUIP))  if os.path.exists(CUR_EQUIP)  else fetch_rows(resolve_target_table_id())
     diff_schema = json.load(open(DIFF_SCHEMA)) if os.path.exists(DIFF_SCHEMA) else []
     diff_equip  = json.load(open(DIFF_EQUIP))  if os.path.exists(DIFF_EQUIP)  else []
 
-    # Marque kind/status à partir du DIFF FIABLE
+    # Marquer kind à partir du diff
     equip_full  = mark_status_equip(cur_equip, diff_equip)
+    counts = {"ADDED_ROW":0,"CHANGED_ROW":0,"REMOVED_ROW":0}
+    for d in diff_equip: counts[d["changeType"]] = counts.get(d["changeType"],0)+1
+
     return jsonify({
-        "summary": f"{len(diff_schema)} chgt schéma, {len(diff_equip)} chgt contenu",
-        "schema_full": cur_schema,   # pas besoin d'y injecter status ici
-        "equip_full": equip_full     # contient status + kind
+        "summary": f"{len(diff_schema)} chgts schéma, {len(diff_equip)} chgts contenu",
+        "schema_full": cur_schema,
+        "equip_full": equip_full,
+        "content_counts": counts
     })
 
 if __name__ == "__main__":
