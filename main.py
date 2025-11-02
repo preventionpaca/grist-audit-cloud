@@ -5,25 +5,29 @@ Audit complet Grist (structure + contenu d'une table spécifique)
 Version cloud optimisée pour Render (Python 3)
 """
 
-import os, json, time, re, threading
+import os, json, time, re, threading, unicodedata
 from datetime import datetime
 import requests
 from flask import Flask, jsonify
 
 # ----------------------------------------------------------
-# 🔧 Configuration générale
+# 🔧 Configuration générale (surchargeables via env Render)
 # ----------------------------------------------------------
 HOST = os.getenv("GRIST_HOST", "https://docs.getgrist.com")
 DOC = os.getenv("GRIST_DOC_ID") or ""
 API_KEY = os.getenv("GRIST_API_KEY") or ""
-TARGET_TABLE = os.getenv("GRIST_TABLE", "Liste_des_equipements")
-DATA_DIR = os.getenv("DATA_DIR", os.getcwd())
 
-CUR_SCHEMA = os.path.join(DATA_DIR, "schema_current.json")
+# Cible (par nom d'usage) et variantes de forçage
+TARGET_TABLE        = os.getenv("GRIST_TABLE", "Liste_des_equipements")
+TARGET_TABLE_ID     = os.getenv("GRIST_TABLE_ID") or ""      # ← si tu connais l'id exact
+TARGET_TABLE_NAME   = os.getenv("GRIST_TABLE_NAME") or ""    # ← si libellé différent
+
+DATA_DIR = os.getenv("DATA_DIR", os.getcwd())
+CUR_SCHEMA  = os.path.join(DATA_DIR, "schema_current.json")
 DIFF_SCHEMA = os.path.join(DATA_DIR, "schema_diff.json")
-CUR_EQUIP = os.path.join(DATA_DIR, "equip_current.json")
-DIFF_EQUIP = os.path.join(DATA_DIR, "equip_diff.json")
-LOCK_FILE = os.path.join(DATA_DIR, ".lock")
+CUR_EQUIP   = os.path.join(DATA_DIR, "equip_current.json")
+DIFF_EQUIP  = os.path.join(DATA_DIR, "equip_diff.json")
+LOCK_FILE   = os.path.join(DATA_DIR, ".lock")
 
 # État global de progression (pour /status)
 PROGRESS = {"busy": False, "percent": 0, "step": ""}
@@ -35,7 +39,7 @@ def _req(method, url, **kw):
     for i in range(4):
         try:
             r = requests.request(method, url, timeout=40, **kw)
-            if r.status_code in (502,503,504):
+            if r.status_code in (502, 503, 504):
                 time.sleep(1.5*(i+1)); continue
             r.raise_for_status()
             return r
@@ -48,88 +52,130 @@ def api_get(path, params=None):
     headers = {'Authorization': f'Bearer {API_KEY}'}
     return _req('GET', url, headers=headers, params=params).json()
 
-def list_tables(): return api_get(f"/docs/{DOC}/tables").get("tables", [])
-def list_columns(t): return api_get(f"/docs/{DOC}/tables/{t}/columns", params={"hidden":"true"}).get("columns", [])
-def fetch_rows(table): return api_get(f"/docs/{DOC}/tables/{table}/data").get("records", [])
+def list_tables():          return api_get(f"/docs/{DOC}/tables").get("tables", [])
+def list_columns(tid):      return api_get(f"/docs/{DOC}/tables/{tid}/columns", params={"hidden":"true"}).get("columns", [])
+def fetch_rows(table_id):   return api_get(f"/docs/{DOC}/tables/{table_id}/data").get("records", [])
 
-def ref_target(t):
-    """Détecte les liaisons Ref / RefList"""
-    if not isinstance(t,str): return ""
-    m=re.match(r"^Ref(?:List)?:([\w.$-]+)$",t)
-    return m.group(1) if m else ""
+# ----------------------------------------------------------
+# 🧭 Résolution robuste de l'ID réel de la table cible
+# ----------------------------------------------------------
+def _normalize(s: str) -> str:
+    """minuscules, sans accents, espaces/points → underscores"""
+    s = str(s or "")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = s.lower().strip()
+    s = re.sub(r"[ .]+", "_", s)
+    return s
+
+def resolve_target_table_id() -> str:
+    """
+    Trouve l'id interne de la table à auditer.
+    Priorité :
+      1) GRIST_TABLE_ID (forçage explicite)
+      2) correspondance exacte id
+      3) correspondance exacte name affiché
+      4) correspondance normalisée (id ou name)
+      5) fallback: TARGET_TABLE tel quel
+    """
+    if TARGET_TABLE_ID:
+        return TARGET_TABLE_ID
+
+    wanted = TARGET_TABLE_NAME or TARGET_TABLE
+    wanted_norm = _normalize(wanted)
+
+    for t in list_tables():
+        tid  = t.get("id", "")
+        name = t.get("name", "") or tid
+        if tid == wanted or name == wanted:
+            return tid
+        if _normalize(tid) == wanted_norm or _normalize(name) == wanted_norm:
+            return tid
+
+    return wanted  # dernier recours
 
 # ----------------------------------------------------------
 # 📊 Analyse du schéma
 # ----------------------------------------------------------
-FIELDS=["type","isFormula","refTableId","visibleCol","label","description"]
+def ref_target(t):
+    """Détecte les liaisons Ref / RefList → renvoie table cible si présente"""
+    if not isinstance(t, str): return ""
+    m = re.match(r"^Ref(?:List)?:([\w.$-]+)$", t)
+    return m.group(1) if m else ""
+
+FIELDS = ["type", "isFormula", "refTableId", "visibleCol", "label", "description"]
 
 def scan_schema():
     """Parcourt toutes les tables et colonnes du document"""
-    rows=[]
+    rows = []
     for t in list_tables():
-        tid=t.get("id"); pos=0
+        tid = t.get("id"); pos = 0
         for c in list_columns(tid):
-            f=c.get("fields") or {}
-            type_=f.get("type",""); tgt=ref_target(type_)
+            f = c.get("fields") or {}
+            type_ = f.get("type", ""); tgt = ref_target(type_)
             rows.append({
-                "tableId":tid,
-                "colId":c.get("id",""),
-                "label":f.get("label",""),
-                "type":type_,
-                "isFormula":bool(f.get("isFormula")) or bool(f.get("formula")),
-                "formula":(f.get("formula") or "")[:240],
-                "isRef":bool(tgt),
-                "refTableId":tgt,
-                "visibleCol":f.get("visibleCol"),
-                "description":(f.get("description") or "")[:240],
-                "pos":pos
-            }); pos+=1
+                "tableId": tid,
+                "colId": c.get("id", ""),
+                "label": f.get("label", ""),
+                "type": type_,
+                "isFormula": bool(f.get("isFormula")) or bool(f.get("formula")),
+                "formula": (f.get("formula") or "")[:240],
+                "isRef": bool(tgt),
+                "refTableId": tgt,
+                "visibleCol": f.get("visibleCol"),
+                "description": (f.get("description") or "")[:240],
+                "pos": pos
+            }); pos += 1
     return rows
 
-def _index(rows):  return { (r.get("tableId",""), r.get("colId","")): r for r in rows }
-def _tables(rows): return set(r.get("tableId","") for r in rows)
+def _index(rows):   return { (r.get("tableId",""), r.get("colId","")): r for r in rows }
+def _tables(rows):  return set(r.get("tableId","") for r in rows)
 
 def make_schema_diff(cur, base):
     """Compare le schéma actuel avec la baseline"""
-    out=[]
-    ic,ib=_index(cur),_index(base)
-    tc,tb=_tables(cur),_tables(base)
-    for t in sorted(tc - tb): out.append({"changeType":"ADDED_TABLE","tableId":t})
-    for t in sorted(tb - tc): out.append({"changeType":"REMOVED_TABLE","tableId":t})
+    out = []
+    ic, ib = _index(cur), _index(base)
+    tc, tb = _tables(cur), _tables(base)
+
+    for t in sorted(tc - tb): out.append({"changeType": "ADDED_TABLE", "tableId": t})
+    for t in sorted(tb - tc): out.append({"changeType": "REMOVED_TABLE", "tableId": t})
+
     for k in sorted(set(ic.keys()) | set(ib.keys())):
-        c,b = ic.get(k), ib.get(k); t,col = k
-        if c and not b: out.append({"changeType":"ADDED_COL","tableId":t,"colId":col})
-        elif b and not c: out.append({"changeType":"REMOVED_COL","tableId":t,"colId":col})
+        c, b = ic.get(k), ib.get(k); t, col = k
+        if c and not b: out.append({"changeType": "ADDED_COL", "tableId": t, "colId": col})
+        elif b and not c: out.append({"changeType": "REMOVED_COL", "tableId": t, "colId": col})
         elif c and b:
             for f in FIELDS:
                 if b.get(f) != c.get(f):
                     out.append({
-                        "changeType":"CHANGED_FIELD",
-                        "tableId":t,"colId":col,"field":f,
-                        "oldValue":str(b.get(f)),"newValue":str(c.get(f))
+                        "changeType": "CHANGED_FIELD",
+                        "tableId": t, "colId": col, "field": f,
+                        "oldValue": str(b.get(f)), "newValue": str(c.get(f))
                     })
     return out
 
+# ----------------------------------------------------------
+# 🧩 Analyse du contenu de la table cible
+# ----------------------------------------------------------
 def make_equip_diff(cur, base):
-    """Compare le contenu de la table cible"""
-    cur_idx = {r["id"]:r["fields"] for r in cur}
-    base_idx = {r["id"]:r["fields"] for r in base}
-    out=[]
+    """Compare le contenu de la table cible (par id d'enregistrement)"""
+    cur_idx  = {r["id"]: r["fields"] for r in cur}
+    base_idx = {r["id"]: r["fields"] for r in base}
+    out = []
     for id_ in set(cur_idx.keys()) | set(base_idx.keys()):
-        c,b = cur_idx.get(id_), base_idx.get(id_)
-        if c and not b: out.append({"changeType":"ADDED_ROW","id":id_})
-        elif b and not c: out.append({"changeType":"REMOVED_ROW","id":id_})
-        elif c != b: out.append({"changeType":"CHANGED_ROW","id":id_})
+        c, b = cur_idx.get(id_), base_idx.get(id_)
+        if c and not b: out.append({"changeType": "ADDED_ROW",   "id": id_})
+        elif b and not c: out.append({"changeType": "REMOVED_ROW","id": id_})
+        elif c != b: out.append({"changeType": "CHANGED_ROW",    "id": id_})
     return out
 
 # ----------------------------------------------------------
-# 🎨 Couleurs et statuts
+# 🎨 Statuts (pour coloration côté widget)
 # ----------------------------------------------------------
 def mark_status_schema(cur, diff):
     status_map = {}
     for d in diff:
         key = (d.get("tableId"), d.get("colId"))
-        if "ADDED" in d["changeType"]: status_map[key] = "added"
+        if "ADDED"   in d["changeType"]: status_map[key] = "added"
         elif "REMOVED" in d["changeType"]: status_map[key] = "removed"
         elif "CHANGED" in d["changeType"]: status_map[key] = "changed"
     for r in cur:
@@ -141,20 +187,23 @@ def mark_status_equip(cur, diff):
     status_map = {}
     for d in diff:
         id_ = d.get("id")
-        if "ADDED" in d["changeType"]: status_map[id_] = "added"
+        if "ADDED"   in d["changeType"]: status_map[id_] = "added"
         elif "REMOVED" in d["changeType"]: status_map[id_] = "removed"
         elif "CHANGED" in d["changeType"]: status_map[id_] = "changed"
     for r in cur:
         r["status"] = status_map.get(r["id"], "normal")
     return cur
 
-def save_json(o,p): open(p,"w",encoding="utf-8").write(json.dumps(o,ensure_ascii=False,indent=2))
+def save_json(o, p): 
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(o, f, ensure_ascii=False, indent=2)
 
 # ----------------------------------------------------------
 # 🌐 Serveur Flask (Render)
 # ----------------------------------------------------------
 app = Flask(__name__)
 
+# CORS pour le widget HTML Grist
 @app.after_request
 def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -164,11 +213,12 @@ def add_cors_headers(resp):
 
 @app.route("/", defaults={"_path": ""}, methods=["OPTIONS"])
 @app.route("/<path:_path>", methods=["OPTIONS"])
-def cors_preflight(_path): return ("", 204)
+def cors_preflight(_path): 
+    return ("", 204)
 
 @app.get("/")
 def index():
-    return jsonify({"service":"grist-audit-cloud","ok":True,"hint":"use /run then /result"})
+    return jsonify({"service": "grist-audit-cloud", "ok": True, "hint": "use /run then /result"})
 
 @app.get("/status")
 def status():
@@ -178,7 +228,9 @@ def status():
         "busy": PROGRESS["busy"],
         "percent": PROGRESS["percent"],
         "step": PROGRESS["step"],
-        "time": datetime.utcnow().isoformat()+"Z"
+        "target_table": TARGET_TABLE,
+        "resolved_table_id": resolve_target_table_id(),
+        "time": datetime.utcnow().isoformat() + "Z"
     })
 
 # ----------------------------------------------------------
@@ -193,8 +245,14 @@ def background_audit():
         PROGRESS.update({"percent": 25, "step": "Scan du schéma"})
         cur_schema = scan_schema()
 
-        PROGRESS.update({"percent": 55, "step": f"Lecture de {TARGET_TABLE}"})
-        cur_equip  = fetch_rows(TARGET_TABLE)
+        real_id = resolve_target_table_id()
+        PROGRESS.update({"percent": 55, "step": f"Lecture de {real_id}"})
+        cur_equip = []
+        try:
+            cur_equip = fetch_rows(real_id)
+        except Exception as e:
+            # Ne pas casser l'audit si la table n'est pas lisible
+            PROGRESS.update({"step": f"Impossible de lire {real_id}: {e}"})
 
         PROGRESS.update({"percent": 75, "step": "Calcul des différences"})
         diff_schema = make_schema_diff(cur_schema, base_schema)
@@ -210,7 +268,9 @@ def background_audit():
         time.sleep(0.5)
     finally:
         PROGRESS.update({"busy": False})
-        if os.path.exists(LOCK_FILE): os.remove(LOCK_FILE)
+        if os.path.exists(LOCK_FILE): 
+            try: os.remove(LOCK_FILE)
+            except: pass
 
 # ----------------------------------------------------------
 # 🧠 Routes API principales
@@ -219,14 +279,15 @@ def background_audit():
 def run():
     if PROGRESS["busy"]:
         return jsonify({"ok": False, "busy": True})
-    open(LOCK_FILE,"w").write("run")
+    open(LOCK_FILE, "w").write("run")
     threading.Thread(target=background_audit, daemon=True).start()
     return jsonify({"ok": True, "started": True})
 
 @app.get("/result")
 def result():
+    # Toujours renvoyer la structure et le contenu (même sans diff)
     cur_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else scan_schema()
-    cur_equip  = json.load(open(CUR_EQUIP))  if os.path.exists(CUR_EQUIP)  else fetch_rows(TARGET_TABLE)
+    cur_equip  = json.load(open(CUR_EQUIP))  if os.path.exists(CUR_EQUIP)  else fetch_rows(resolve_target_table_id())
     diff_schema = json.load(open(DIFF_SCHEMA)) if os.path.exists(DIFF_SCHEMA) else []
     diff_equip  = json.load(open(DIFF_EQUIP))  if os.path.exists(DIFF_EQUIP)  else []
     schema_full = mark_status_schema(cur_schema, diff_schema)
@@ -238,8 +299,8 @@ def result():
     })
 
 # ----------------------------------------------------------
-# 🚀 Lancement
+# 🚀 Lancement local (Render définit PORT automatiquement)
 # ----------------------------------------------------------
-if __name__=="__main__":
-    port=int(os.getenv("PORT","8000"))
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
