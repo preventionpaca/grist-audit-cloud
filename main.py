@@ -51,16 +51,26 @@ def list_tables():        return api_get(f"/docs/{DOC}/tables").get("tables", []
 def list_columns(tid):    return api_get(f"/docs/{DOC}/tables/{tid}/columns", params={"hidden":"true"}).get("columns", [])
 
 def fetch_rows(table_id):
-    """Récupère TOUTES les lignes avec pagination."""
-    all_recs, offset, page = [], 0, 5000
-    while True:
-        data = api_get(f"/docs/{DOC}/tables/{table_id}/data",
-                       params={"limit": page, "offset": offset})
-        recs = data.get("records", [])
-        all_recs.extend(recs)
-        if len(recs) < page: break
-        offset += page
-    return all_recs
+    """Récupère TOUTES les lignes d'une table, avec pagination.
+       1) essaie /records ; 2) si vide, retente /data (certaines configs)."""
+    def _paged(path):
+        all_recs, offset, page = [], 0, 5000
+        while True:
+            data = api_get(path, params={"limit": page, "offset": offset})
+            recs = data.get("records", [])
+            all_recs.extend(recs)
+            if len(recs) < page:
+                break
+            offset += page
+        return all_recs
+
+    # Essai 1: /records
+    recs = _paged(f"/docs/{DOC}/tables/{table_id}/records")
+    if recs:
+        return recs
+
+    # Essai 2: /data
+    return _paged(f"/docs/{DOC}/tables/{table_id}/data")
 
 # ---------------------- Résolution robuste table cible ----------------
 def _normalize(s: str) -> str:
@@ -200,13 +210,20 @@ def status():
         "time": datetime.utcnow().isoformat()+"Z"
     })
 
-# Debug pratique : voir échantillon brut de la table cible
+# Debug pratique : compare /records vs /data
 @app.get("/debug/equip")
 def debug_equip():
     tid = resolve_target_table_id()
     try:
-        sample = fetch_rows(tid)[:3]
-        return jsonify({"resolved_table_id": tid, "sample_count": len(sample), "sample": sample})
+        recs_records = api_get(f"/docs/{DOC}/tables/{tid}/records", params={"limit": 3}).get("records", [])
+        recs_data    = api_get(f"/docs/{DOC}/tables/{tid}/data",    params={"limit": 3}).get("records", [])
+        return jsonify({
+            "resolved_table_id": tid,
+            "records_endpoint_count": len(recs_records),
+            "data_endpoint_count": len(recs_data),
+            "records_sample": recs_records,
+            "data_sample": recs_data
+        })
     except Exception as e:
         return jsonify({"resolved_table_id": tid, "error": str(e)}), 500
 
