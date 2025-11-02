@@ -5,7 +5,7 @@ from datetime import datetime
 import requests
 from flask import Flask, jsonify, send_from_directory
 
-# ---- Config ----
+# ---- Configuration ----
 HOST = os.getenv("GRIST_HOST", "https://docs.getgrist.com")
 DOC = os.getenv("GRIST_DOC_ID") or ""
 API_KEY = os.getenv("GRIST_API_KEY") or ""
@@ -18,6 +18,7 @@ CUR_EQUIP = os.path.join(DATA_DIR, "equip_current.json")
 DIFF_EQUIP = os.path.join(DATA_DIR, "equip_diff.json")
 LOCK_FILE = os.path.join(DATA_DIR, ".lock")
 
+# ---- API helpers ----
 def _req(method, url, **kw):
     for i in range(4):
         try:
@@ -45,6 +46,7 @@ def ref_target(t):
 
 FIELDS=["type","isFormula","refTableId","visibleCol","label","description"]
 
+# ---- Schéma ----
 def scan_schema():
     rows=[]
     for t in list_tables():
@@ -53,10 +55,14 @@ def scan_schema():
             f=c.get("fields") or {}
             type_=f.get("type",""); tgt=ref_target(type_)
             rows.append({
-                "tableId":tid,"colId":c.get("id",""),"label":f.get("label",""),
-                "type":type_,"isFormula":bool(f.get("isFormula")) or bool(f.get("formula")),
+                "tableId":tid,
+                "colId":c.get("id",""),
+                "label":f.get("label",""),
+                "type":type_,
+                "isFormula":bool(f.get("isFormula")) or bool(f.get("formula")),
                 "formula":(f.get("formula") or "")[:240],
-                "isRef":bool(tgt),"refTableId":tgt,
+                "isRef":bool(tgt),
+                "refTableId":tgt,
                 "visibleCol":f.get("visibleCol"),
                 "description":(f.get("description") or "")[:240],
                 "pos":pos
@@ -97,6 +103,7 @@ def make_equip_diff(cur, base):
         elif c != b: out.append({"changeType":"CHANGED_ROW","id":id_})
     return out
 
+# ---- Coloration (status) ----
 def mark_status_schema(cur, diff):
     status_map = {}
     for d in diff:
@@ -122,7 +129,7 @@ def mark_status_equip(cur, diff):
 
 def save_json(o,p): open(p,"w",encoding="utf-8").write(json.dumps(o,ensure_ascii=False,indent=2))
 
-# ---- Flask ----
+# ---- Flask app ----
 app = Flask(__name__)
 
 @app.after_request
@@ -173,8 +180,9 @@ def run():
 
 @app.get("/result")
 def result():
-    cur_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else []
-    cur_equip  = json.load(open(CUR_EQUIP)) if os.path.exists(CUR_EQUIP) else []
+    # toujours renvoyer le schéma et la table, même sans diff
+    cur_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else scan_schema()
+    cur_equip  = json.load(open(CUR_EQUIP)) if os.path.exists(CUR_EQUIP) else fetch_rows(TARGET_TABLE)
     diff_schema = json.load(open(DIFF_SCHEMA)) if os.path.exists(DIFF_SCHEMA) else []
     diff_equip = json.load(open(DIFF_EQUIP)) if os.path.exists(DIFF_EQUIP) else []
     schema_full = mark_status_schema(cur_schema, diff_schema)
@@ -184,9 +192,6 @@ def result():
         "schema_full": schema_full,
         "equip_full": equip_full
     })
-
-@app.get("/files/<path:fname>")
-def files(fname): return send_from_directory(DATA_DIR,fname,mimetype="application/json")
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","8000"))
