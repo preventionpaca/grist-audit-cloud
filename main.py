@@ -136,7 +136,30 @@ def make_schema_diff(cur, base):
 
 # ------------- Diff contenu fiable ------------
 def make_equip_diff(cur, base):
-    """Compare par id: ADDED_ROW / CHANGED_ROW / REMOVED_ROW."""
+def _is_empty_fields(fields: dict) -> bool:
+    """
+    Considère 'vide' si tous les champs sont None / "" / [] / {}.
+    (Tolère les colonnes système ou calculées qui peuvent être absentes.)
+    """
+    if not isinstance(fields, dict):
+        return True
+    for v in fields.values():
+        if v is None: 
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        if isinstance(v, (list, tuple, set)) and len(v) == 0:
+            continue
+        if isinstance(v, dict) and len(v) == 0:
+            continue
+        # Valeur substantielle trouvée → pas vide
+        return False
+    return True
+
+def make_equip_diff(cur, base):
+    """
+    Compare par id et reclasse 'CHANGED' en 'ADDED' si le 'before' est vide.
+    """
     cur_idx  = {r["id"]: r.get("fields", {}) for r in (cur or [])}
     base_idx = {r["id"]: r.get("fields", {}) for r in (base or [])}
     out=[]
@@ -148,8 +171,13 @@ def make_equip_diff(cur, base):
         elif b is not None and c is None:
             out.append({"changeType":"REMOVED_ROW","id":rid})
         elif c != b:
-            out.append({"changeType":"CHANGED_ROW","id":rid})
+            # << heuristique "création à partir d'une ligne vide" >>
+            if _is_empty_fields(b):
+                out.append({"changeType":"ADDED_ROW","id":rid})
+            else:
+                out.append({"changeType":"CHANGED_ROW","id":rid})
     return out
+
 
 def mark_status_equip(cur, diff):
     """Ajoute rec.kind (added/changed/removed/normal) sur l'état courant."""
