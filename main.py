@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Audit complet Grist (structure + contenu d'une table spécifique)
+Version cloud optimisée pour Render (Python 3)
+"""
+
 import os, json, time, re, threading
 from datetime import datetime
 import requests
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify
 
-# ---- Configuration ----
+# ----------------------------------------------------------
+# 🔧 Configuration générale
+# ----------------------------------------------------------
 HOST = os.getenv("GRIST_HOST", "https://docs.getgrist.com")
 DOC = os.getenv("GRIST_DOC_ID") or ""
 API_KEY = os.getenv("GRIST_API_KEY") or ""
@@ -18,7 +25,12 @@ CUR_EQUIP = os.path.join(DATA_DIR, "equip_current.json")
 DIFF_EQUIP = os.path.join(DATA_DIR, "equip_diff.json")
 LOCK_FILE = os.path.join(DATA_DIR, ".lock")
 
-# ---- API helpers ----
+# État global de progression (pour /status)
+PROGRESS = {"busy": False, "percent": 0, "step": ""}
+
+# ----------------------------------------------------------
+# 🔗 Fonctions API REST Grist
+# ----------------------------------------------------------
 def _req(method, url, **kw):
     for i in range(4):
         try:
@@ -40,14 +52,19 @@ def list_tables(): return api_get(f"/docs/{DOC}/tables").get("tables", [])
 def list_columns(t): return api_get(f"/docs/{DOC}/tables/{t}/columns", params={"hidden":"true"}).get("columns", [])
 def fetch_rows(table): return api_get(f"/docs/{DOC}/tables/{table}/data").get("records", [])
 
-def ref_target(t): 
+def ref_target(t):
+    """Détecte les liaisons Ref / RefList"""
     if not isinstance(t,str): return ""
-    m=re.match(r"^Ref(?:List)?:([\w.$-]+)$",t); return m.group(1) if m else ""
+    m=re.match(r"^Ref(?:List)?:([\w.$-]+)$",t)
+    return m.group(1) if m else ""
 
+# ----------------------------------------------------------
+# 📊 Analyse du schéma
+# ----------------------------------------------------------
 FIELDS=["type","isFormula","refTableId","visibleCol","label","description"]
 
-# ---- Schéma ----
 def scan_schema():
+    """Parcourt toutes les tables et colonnes du document"""
     rows=[]
     for t in list_tables():
         tid=t.get("id"); pos=0
@@ -73,6 +90,7 @@ def _index(rows):  return { (r.get("tableId",""), r.get("colId","")): r for r in
 def _tables(rows): return set(r.get("tableId","") for r in rows)
 
 def make_schema_diff(cur, base):
+    """Compare le schéma actuel avec la baseline"""
     out=[]
     ic,ib=_index(cur),_index(base)
     tc,tb=_tables(cur),_tables(base)
@@ -93,6 +111,7 @@ def make_schema_diff(cur, base):
     return out
 
 def make_equip_diff(cur, base):
+    """Compare le contenu de la table cible"""
     cur_idx = {r["id"]:r["fields"] for r in cur}
     base_idx = {r["id"]:r["fields"] for r in base}
     out=[]
@@ -103,7 +122,9 @@ def make_equip_diff(cur, base):
         elif c != b: out.append({"changeType":"CHANGED_ROW","id":id_})
     return out
 
-# ---- Coloration (status) ----
+# ----------------------------------------------------------
+# 🎨 Couleurs et statuts
+# ----------------------------------------------------------
 def mark_status_schema(cur, diff):
     status_map = {}
     for d in diff:
@@ -129,7 +150,9 @@ def mark_status_equip(cur, diff):
 
 def save_json(o,p): open(p,"w",encoding="utf-8").write(json.dumps(o,ensure_ascii=False,indent=2))
 
-# ---- Flask app ----
+# ----------------------------------------------------------
+# 🌐 Serveur Flask (Render)
+# ----------------------------------------------------------
 app = Flask(__name__)
 
 @app.after_request
@@ -144,55 +167,79 @@ def add_cors_headers(resp):
 def cors_preflight(_path): return ("", 204)
 
 @app.get("/")
-def index(): 
-    return jsonify({"service":"grist-audit-cloud","ok":True,"hint":"use /run, /result"})
+def index():
+    return jsonify({"service":"grist-audit-cloud","ok":True,"hint":"use /run then /result"})
 
 @app.get("/status")
 def status():
     return jsonify({
         "ok": bool(API_KEY and DOC),
         "doc": DOC,
-        "host": HOST,
+        "busy": PROGRESS["busy"],
+        "percent": PROGRESS["percent"],
+        "step": PROGRESS["step"],
         "time": datetime.utcnow().isoformat()+"Z"
     })
 
+# ----------------------------------------------------------
+# 🧮 Thread d'audit
+# ----------------------------------------------------------
 def background_audit():
-    open(LOCK_FILE,"w").write("run")
+    PROGRESS.update({"busy": True, "percent": 5, "step": "Initialisation"})
     try:
         base_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else []
-        base_equip  = json.load(open(CUR_EQUIP)) if os.path.exists(CUR_EQUIP) else []
+        base_equip  = json.load(open(CUR_EQUIP))  if os.path.exists(CUR_EQUIP)  else []
+
+        PROGRESS.update({"percent": 25, "step": "Scan du schéma"})
         cur_schema = scan_schema()
+
+        PROGRESS.update({"percent": 55, "step": f"Lecture de {TARGET_TABLE}"})
         cur_equip  = fetch_rows(TARGET_TABLE)
-        save_json(cur_schema, CUR_SCHEMA)
-        save_json(cur_equip, CUR_EQUIP)
+
+        PROGRESS.update({"percent": 75, "step": "Calcul des différences"})
         diff_schema = make_schema_diff(cur_schema, base_schema)
-        diff_equip = make_equip_diff(cur_equip, base_equip)
+        diff_equip  = make_equip_diff(cur_equip, base_equip)
+
+        PROGRESS.update({"percent": 90, "step": "Sauvegarde"})
+        save_json(cur_schema, CUR_SCHEMA)
+        save_json(cur_equip,  CUR_EQUIP)
         save_json(diff_schema, DIFF_SCHEMA)
-        save_json(diff_equip, DIFF_EQUIP)
+        save_json(diff_equip,  DIFF_EQUIP)
+
+        PROGRESS.update({"percent": 100, "step": "Terminé"})
+        time.sleep(0.5)
     finally:
+        PROGRESS.update({"busy": False})
         if os.path.exists(LOCK_FILE): os.remove(LOCK_FILE)
 
+# ----------------------------------------------------------
+# 🧠 Routes API principales
+# ----------------------------------------------------------
 @app.post("/run")
 def run():
-    if os.path.exists(LOCK_FILE): return jsonify({"ok":False,"busy":True})
-    threading.Thread(target=background_audit,daemon=True).start()
-    return jsonify({"ok":True,"started":True})
+    if PROGRESS["busy"]:
+        return jsonify({"ok": False, "busy": True})
+    open(LOCK_FILE,"w").write("run")
+    threading.Thread(target=background_audit, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
 
 @app.get("/result")
 def result():
-    # toujours renvoyer le schéma et la table, même sans diff
     cur_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else scan_schema()
-    cur_equip  = json.load(open(CUR_EQUIP)) if os.path.exists(CUR_EQUIP) else fetch_rows(TARGET_TABLE)
+    cur_equip  = json.load(open(CUR_EQUIP))  if os.path.exists(CUR_EQUIP)  else fetch_rows(TARGET_TABLE)
     diff_schema = json.load(open(DIFF_SCHEMA)) if os.path.exists(DIFF_SCHEMA) else []
-    diff_equip = json.load(open(DIFF_EQUIP)) if os.path.exists(DIFF_EQUIP) else []
+    diff_equip  = json.load(open(DIFF_EQUIP))  if os.path.exists(DIFF_EQUIP)  else []
     schema_full = mark_status_schema(cur_schema, diff_schema)
-    equip_full = mark_status_equip(cur_equip, diff_equip)
+    equip_full  = mark_status_equip(cur_equip,  diff_equip)
     return jsonify({
         "summary": f"{len(diff_schema)} chgt schéma, {len(diff_equip)} chgt contenu",
         "schema_full": schema_full,
         "equip_full": equip_full
     })
 
+# ----------------------------------------------------------
+# 🚀 Lancement
+# ----------------------------------------------------------
 if __name__=="__main__":
     port=int(os.getenv("PORT","8000"))
-    app.run(host="0.0.0.0",port=port)
+    app.run(host="0.0.0.0", port=port)
