@@ -18,7 +18,6 @@ CUR_EQUIP = os.path.join(DATA_DIR, "equip_current.json")
 DIFF_EQUIP = os.path.join(DATA_DIR, "equip_diff.json")
 LOCK_FILE = os.path.join(DATA_DIR, ".lock")
 
-# ---- Fonctions utilitaires ----
 def _req(method, url, **kw):
     for i in range(4):
         try:
@@ -44,8 +43,8 @@ def ref_target(t):
     if not isinstance(t,str): return ""
     m=re.match(r"^Ref(?:List)?:([\w.$-]+)$",t); return m.group(1) if m else ""
 
-# ---- Scan du schéma ----
 FIELDS=["type","isFormula","refTableId","visibleCol","label","description"]
+
 def scan_schema():
     rows=[]
     for t in list_tables():
@@ -56,8 +55,11 @@ def scan_schema():
             rows.append({
                 "tableId":tid,"colId":c.get("id",""),"label":f.get("label",""),
                 "type":type_,"isFormula":bool(f.get("isFormula")) or bool(f.get("formula")),
-                "formula":(f.get("formula") or "")[:240],"isRef":bool(tgt),"refTableId":tgt,
-                "visibleCol":f.get("visibleCol"),"description":(f.get("description") or "")[:240],"pos":pos
+                "formula":(f.get("formula") or "")[:240],
+                "isRef":bool(tgt),"refTableId":tgt,
+                "visibleCol":f.get("visibleCol"),
+                "description":(f.get("description") or "")[:240],
+                "pos":pos
             }); pos+=1
     return rows
 
@@ -65,20 +67,25 @@ def _index(rows):  return { (r.get("tableId",""), r.get("colId","")): r for r in
 def _tables(rows): return set(r.get("tableId","") for r in rows)
 
 def make_schema_diff(cur, base):
-    out=[]; ic,ib=_index(cur),_index(base); tc,tb=_tables(cur),_tables(base)
+    out=[]
+    ic,ib=_index(cur),_index(base)
+    tc,tb=_tables(cur),_tables(base)
     for t in sorted(tc - tb): out.append({"changeType":"ADDED_TABLE","tableId":t})
     for t in sorted(tb - tc): out.append({"changeType":"REMOVED_TABLE","tableId":t})
     for k in sorted(set(ic.keys()) | set(ib.keys())):
         c,b = ic.get(k), ib.get(k); t,col = k
-        if c and not b: out.append({"changeType":"ADDED_COL","tableId":t,"colId":col}); continue
-        if b and not c: out.append({"changeType":"REMOVED_COL","tableId":t,"colId":col}); continue
-        for f in FIELDS:
-            ov,nv = b.get(f), c.get(f)
-            if ov != nv:
-                out.append({"changeType":"CHANGED_FIELD","tableId":t,"colId":col,"field":f,"oldValue":str(ov),"newValue":str(nv)})
+        if c and not b: out.append({"changeType":"ADDED_COL","tableId":t,"colId":col})
+        elif b and not c: out.append({"changeType":"REMOVED_COL","tableId":t,"colId":col})
+        elif c and b:
+            for f in FIELDS:
+                if b.get(f) != c.get(f):
+                    out.append({
+                        "changeType":"CHANGED_FIELD",
+                        "tableId":t,"colId":col,"field":f,
+                        "oldValue":str(b.get(f)),"newValue":str(c.get(f))
+                    })
     return out
 
-# ---- Scan du contenu ----
 def make_equip_diff(cur, base):
     cur_idx = {r["id"]:r["fields"] for r in cur}
     base_idx = {r["id"]:r["fields"] for r in base}
@@ -87,8 +94,31 @@ def make_equip_diff(cur, base):
         c,b = cur_idx.get(id_), base_idx.get(id_)
         if c and not b: out.append({"changeType":"ADDED_ROW","id":id_})
         elif b and not c: out.append({"changeType":"REMOVED_ROW","id":id_})
-        elif c!=b: out.append({"changeType":"CHANGED_ROW","id":id_})
+        elif c != b: out.append({"changeType":"CHANGED_ROW","id":id_})
     return out
+
+def mark_status_schema(cur, diff):
+    status_map = {}
+    for d in diff:
+        key = (d.get("tableId"), d.get("colId"))
+        if "ADDED" in d["changeType"]: status_map[key] = "added"
+        elif "REMOVED" in d["changeType"]: status_map[key] = "removed"
+        elif "CHANGED" in d["changeType"]: status_map[key] = "changed"
+    for r in cur:
+        key = (r["tableId"], r["colId"])
+        r["status"] = status_map.get(key, "normal")
+    return cur
+
+def mark_status_equip(cur, diff):
+    status_map = {}
+    for d in diff:
+        id_ = d.get("id")
+        if "ADDED" in d["changeType"]: status_map[id_] = "added"
+        elif "REMOVED" in d["changeType"]: status_map[id_] = "removed"
+        elif "CHANGED" in d["changeType"]: status_map[id_] = "changed"
+    for r in cur:
+        r["status"] = status_map.get(r["id"], "normal")
+    return cur
 
 def save_json(o,p): open(p,"w",encoding="utf-8").write(json.dumps(o,ensure_ascii=False,indent=2))
 
@@ -128,8 +158,10 @@ def background_audit():
         cur_equip  = fetch_rows(TARGET_TABLE)
         save_json(cur_schema, CUR_SCHEMA)
         save_json(cur_equip, CUR_EQUIP)
-        save_json(make_schema_diff(cur_schema, base_schema), DIFF_SCHEMA)
-        save_json(make_equip_diff(cur_equip, base_equip), DIFF_EQUIP)
+        diff_schema = make_schema_diff(cur_schema, base_schema)
+        diff_equip = make_equip_diff(cur_equip, base_equip)
+        save_json(diff_schema, DIFF_SCHEMA)
+        save_json(diff_equip, DIFF_EQUIP)
     finally:
         if os.path.exists(LOCK_FILE): os.remove(LOCK_FILE)
 
@@ -137,16 +169,20 @@ def background_audit():
 def run():
     if os.path.exists(LOCK_FILE): return jsonify({"ok":False,"busy":True})
     threading.Thread(target=background_audit,daemon=True).start()
-    return jsonify({"ok":True,"started":True,"time":datetime.utcnow().isoformat()+"Z"})
+    return jsonify({"ok":True,"started":True})
 
 @app.get("/result")
 def result():
+    cur_schema = json.load(open(CUR_SCHEMA)) if os.path.exists(CUR_SCHEMA) else []
+    cur_equip  = json.load(open(CUR_EQUIP)) if os.path.exists(CUR_EQUIP) else []
     diff_schema = json.load(open(DIFF_SCHEMA)) if os.path.exists(DIFF_SCHEMA) else []
     diff_equip = json.load(open(DIFF_EQUIP)) if os.path.exists(DIFF_EQUIP) else []
+    schema_full = mark_status_schema(cur_schema, diff_schema)
+    equip_full = mark_status_equip(cur_equip, diff_equip)
     return jsonify({
         "summary": f"{len(diff_schema)} chgt schéma, {len(diff_equip)} chgt contenu",
-        "schema_diff": diff_schema,
-        "equip_diff": diff_equip
+        "schema_full": schema_full,
+        "equip_full": equip_full
     })
 
 @app.get("/files/<path:fname>")
