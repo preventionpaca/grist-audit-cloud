@@ -3,11 +3,10 @@
 """
 Grist Audit Cloud – structure + diff + historique persistant
 - Diff fiable (added/changed/removed) basé sur baseline précédente
-- Heuristique: si 'before' est vide => reclassé en 'added' (création)
-- Historisation persistante des événements (equip_history.json) with before/after + timestamp
-- Fichiers de confort: equip_added.json, equip_removed.json
+- Heuristique: si 'before' est vide => 'added' (création)
+- Historisation persistante (equip_history.json) + confort (equip_added.json, equip_removed.json)
 - /result renvoie l'état courant avec rec.kind (added/changed/normal)
-- /files/<name>.json renvoie toujours 200 (crée [] si absent)
+- /files/<name>.json ne renvoie jamais 404 (crée [] si absent)
 """
 
 import os, json, time, re, threading, unicodedata
@@ -123,7 +122,7 @@ def resolve_target_table_id() -> str:
             return tid
         if _normalize(tid) == wn or _normalize(name) == wn:
             return tid
-    return wanted  # on renvoie la saisie telle quelle si rien trouvé
+    return wanted  # renvoie la saisie telle quelle si rien trouvé
 
 # --------------------- Scan du schéma ----------------------
 def ref_target(t):
@@ -254,6 +253,40 @@ def mark_status_equip(cur, diff):
         r["status"] = "added" if k == "added" else ("changed" if k == "changed" else "normal")
     return cur
 
+# -------- Historisation consolidée (patch robuste) ---------
+def persist_history_from_diff(diff_equip, base_equip, cur_equip,
+                              history_path, removed_path, added_path):
+    """
+    Alimente l'historique persistant (equip_history.json) + fichiers de confort
+    (equip_removed.json, equip_added.json) à partir du diff du run courant.
+    """
+    now_iso  = datetime.utcnow().isoformat() + "Z"
+    base_idx = {r["id"]: r.get("fields", {}) for r in (base_equip or [])}
+    cur_idx  = {r["id"]: r.get("fields", {}) for r in (cur_equip  or [])}
+
+    history = load_json_list(history_path)
+    added_snaps, removed_snaps = [], []
+
+    for d in (diff_equip or []):
+        rid = d["id"]; ct = d["changeType"]  # ADDED_ROW / CHANGED_ROW / REMOVED_ROW
+        before = base_idx.get(rid, {})
+        after  = cur_idx.get(rid, {})
+        history.append({
+            "id": rid,
+            "action": ct.replace("_ROW", "").lower(),  # added / changed / removed
+            "at": now_iso,
+            "before": before,
+            "after": after
+        })
+        if ct == "REMOVED_ROW":
+            removed_snaps.append({"id": rid, "fields": before, "deletedAt": now_iso})
+        elif ct == "ADDED_ROW":
+            added_snaps.append({"id": rid, "fields": after, "createdAt": now_iso})
+
+    save_json(history, history_path)
+    save_json(removed_snaps, removed_path)
+    save_json(added_snaps,   added_path)
+
 # ----------------------- Flask app -------------------------
 app = Flask(__name__)
 
@@ -303,9 +336,7 @@ def files(fname):
     target = mapping.get(fname)
     if not target:
         return jsonify({"error": "unknown file"}), 404
-    # Garantit un JSON
-    default = [] if fname.endswith(".json") else None
-    ensure_json_file(target, default if default is not None else [])
+    ensure_json_file(target, [])
     return send_from_directory(
         directory=os.path.dirname(target) or ".",
         path=os.path.basename(target),
@@ -336,31 +367,14 @@ def background_audit():
         diff_equip  = make_equip_diff(cur_equip, base_equip)
 
         # ---- Historiser événements (added/changed/removed) ----
-        now_iso  = datetime.utcnow().isoformat() + "Z"
-        base_idx = {r["id"]: r.get("fields", {}) for r in (base_equip or [])}
-        cur_idx  = {r["id"]: r.get("fields", {}) for r in (cur_equip  or [])}
-
-        history = load_json_list(EQUIP_HISTORY)
-        for d in diff_equip:
-            rid = d["id"]; ct = d["changeType"]  # ADDED_ROW / CHANGED_ROW / REMOVED_ROW
-            before = base_idx.get(rid, {})
-            after  = cur_idx.get(rid, {})
-            history.append({
-                "id": rid,
-                "action": ct.replace("_ROW", "").lower(),  # added / changed / removed
-                "at": now_iso,
-                "before": before,
-                "after": after
-            })
-        save_json(history, EQUIP_HISTORY)
-
-        # Confort: fichiers dédiés (synchronisés à partir de l'historique)
-        removed = [{"id":h["id"], "fields":h["before"], "deletedAt":h["at"]}
-                   for h in history if h.get("action")=="removed"]
-        added   = [{"id":h["id"], "fields":h["after"],  "createdAt":h["at"]}
-                   for h in history if h.get("action")=="added"]
-        save_json(removed, EQUIP_REMOVED)
-        save_json(added,   EQUIP_ADDED)
+        persist_history_from_diff(
+            diff_equip=diff_equip,
+            base_equip=base_equip,
+            cur_equip=cur_equip,
+            history_path=EQUIP_HISTORY,
+            removed_path=EQUIP_REMOVED,
+            added_path=EQUIP_ADDED
+        )
 
         PROGRESS.update({"percent": 90, "step": "Sauvegarde"})
         save_json(cur_schema, CUR_SCHEMA)
